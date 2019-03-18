@@ -1,0 +1,569 @@
+@require: math
+@require: gr
+@require: color
+@require: annot
+
+
+type document-record = (|
+  title : inline-text ;
+  author : inline-text ;
+  date : inline-text;
+|)
+
+module NewCls : sig
+
+  val document : document-record -> block-text -> document
+
+  direct \ref : [string] inline-cmd
+  direct \ref-page : [string] inline-cmd
+  direct +section : [string?; inline-text; block-text] block-cmd
+  direct +subsection : [string?; inline-text; block-text] block-cmd
+  direct +p : [inline-text] block-cmd
+  direct +pn : [inline-text] block-cmd
+  direct +figure : [string?; inline-text; block-text] block-cmd
+  direct +figure : [string?; inline-text; block-text] block-cmd
+
+end = struct
+
+
+% フォント関係
+
+  % フォントサイズ補正
+  let font-ratio-latin = 1.
+  let font-ratio-cjk = 0.88
+
+
+
+  % (フォント名, フォントサイズ補正, ベースライン補正)
+  let font-latin-roman = (`Junicode`, font-ratio-latin, 0.)
+  let font-latin-bold = (`Junicode-b`, font-ratio-latin, 0.)
+  let font-latin-italic = (`Junicode-it`, font-ratio-latin, 0.)
+  let font-latin-sans = (`lmsans`, font-ratio-latin, 0.)
+  let font-latin-mono = (`lmmono`, font-ratio-latin, 0.)
+  let font-cjk-mincho = (`ipaexm`, font-ratio-cjk, 0.)
+  let font-cjk-gothic = (`ipaexg`, font-ratio-cjk, 0.)
+
+
+
+  % フォント変更用関数
+  let set-cjk-font font-name ctx =
+    ctx |> set-font HanIdeographic font-name
+        |> set-font Kana font-name
+
+
+  let set-latin-font font-name ctx =
+    ctx |> set-font Latin font-name
+
+
+
+
+
+% 相互参照用のコマンド
+
+  % 追加用関数
+    % section番号等は、識別のために :num を付け、ページ番号は :page を付ける
+
+    % unit型
+    let u-register-cross-reference-num s-label s-title =
+      register-cross-reference (s-label ^ `:num`) s-title
+
+
+    % inline-boxes型
+    let ib-register-cross-reference-page s-label s-title =
+      hook-page-break (fun pbinfo _ -> register-cross-reference (s-label ^ `:page`) (arabic pbinfo#page-number))
+
+
+
+  % 取得用関数 返り値はどちらもstring型
+  let s-get-cross-reference-num s-label =
+    match get-cross-reference (s-label ^ `:num`) with
+      | None -> `?`
+      | Some (label) -> label
+
+
+  let s-get-cross-reference-page s-label =
+    match get-cross-reference (s-label ^ `:page`) with
+      | None -> `?`
+      | Some (label) -> label
+
+
+  % ハイパーリンクのキー登録とキー取得
+
+  % 登録 string -> inline-boxes -> inline-boxes
+  let ib-register-location-frame s-key ib =
+    inline-frame-breakable (0pt, 0pt, 0pt, 0pt)
+      (Annot.register-location-frame s-key) ib
+
+
+  % 取得 string -> inline-boxes -> inline-boxes
+  let ib-link-to-location-frame s-key ib =
+    inline-frame-breakable (0pt, 0pt, 0pt, 0pt)
+      (Annot.link-to-location-frame s-key None) ib
+
+
+  % \ref \ref-page 定義
+  let-inline ctx \ref s-key =
+    ib-link-to-location-frame s-key
+      (read-inline ctx (embed-string (s-get-cross-reference-num s-key)))
+
+
+  let-inline ctx \ref-page s-key =
+    ib-link-to-location-frame s-key
+      (read-inline ctx (embed-string (s-get-cross-reference-page s-key)))
+
+
+
+% 本文用設定
+
+  % フォントサイズ
+  let font-size-normal = 12pt
+  let font-size-title = 20pt
+  let font-size-author = 16pt
+  let font-size-date = 16pt
+  let font-size-section = 20pt
+  let font-size-subsection = 16pt
+
+
+  % 基本となるctxの設定
+  let ctx-get-initial-context l-width =
+    get-initial-context l-width (command \math)
+      |> set-font-size font-size-normal
+      |> set-dominant-wide-script Kana
+      |> set-language Kana Japanese
+      |> set-language HanIdeographic Japanese
+      |> set-cjk-font font-cjk-mincho
+      |> set-dominant-narrow-script Latin
+      |> set-language Latin English
+      |> set-latin-font font-latin-roman
+      |> set-hyphen-penalty 100
+      |> set-math-font `lmodern`
+      |> set-manual-rising 0pt % 文字の上下の補正値
+      |> set-text-color Color.black
+
+
+% 目次用設定
+
+  % 目次の「.........」を実装するための関数
+
+    % 回数分だけ同じ it を接続する関数
+    let-rec ib-repeat-inline n ib =
+      if n <= 0 then inline-nil else
+        ib ++ (ib-repeat-inline (n - 1) ib)
+
+    % {.}を(text-width /' get-natural-width {.})文だけ繰り返しつなげる
+    let ib-make-dots-line ctx l-text-width =
+      let ib = read-inline ctx {.} ++ inline-skip 1pt in
+      let n = round (l-text-width /' (get-natural-width ib)) in
+        ib-repeat-inline n ib ++ inline-fil
+
+
+  % 目次の階層を付けるための型の宣言
+    type toc-cls =
+      | Section of string * inline-text
+      | SubSection of string * inline-text
+
+
+  % 階層の区別（toc-cls type）とlabelとtitleを入れるためのリスト (string * string * inline-text) list ref
+    let-mutable toc-list <- [] %[Section (`label-1`, {title-1}); SubSection (`label-2`, {title-2})]
+
+  % labelとtitleを入れるためのリスト (string * inline-text) list ref
+    let-mutable fig-toc-list <- [] %[(`label-1`, {title-1}); (`label-2`, {title-2})]
+    let-mutable table-toc-list <- []
+
+
+  % Section用
+    let bb-make-toc-section ctx l-text-width s-label it-title =
+      let it-num = embed-string (s-get-cross-reference-num s-label) in
+      let it-page = embed-string (s-get-cross-reference-page s-label) in
+      let ib-num = inline-skip 3pt ++  read-inline ctx {#it-num;#it-title;} ++ inline-skip 3pt in
+      let ib-page = inline-skip 3pt ++ read-inline ctx {#it-page;} ++ inline-skip 3pt in
+      let ib-toc-line =
+        let w = l-text-width -' (get-natural-width ib-num) -'
+          (get-natural-width ib-page)
+        in
+          ib-make-dots-line ctx w
+      in
+        line-break true true ctx
+          (ib-link-to-location-frame s-label (ib-num ++ ib-toc-line ++ inline-fil ++ ib-page))
+
+
+  % SubSection用
+    let bb-make-toc-subsection ctx l-text-width s-label it-title =
+      let it-num = embed-string (s-get-cross-reference-num s-label) in
+      let it-page = embed-string (s-get-cross-reference-page s-label) in
+      let ib-num = inline-skip 12pt ++  read-inline ctx {#it-num;#it-title;} ++ inline-skip 3pt in
+      let ib-page = inline-skip 3pt ++ read-inline ctx {#it-page;} ++ inline-skip 3pt in
+        line-break true true ctx
+          (ib-link-to-location-frame s-label (ib-num ++ inline-fil ++ ib-page))
+
+
+  % 図目次用
+    let bb-make-toc-figure ctx l-text-width s-label it-title =
+      let it-num = embed-string (s-get-cross-reference-num s-label) in
+      let it-page = embed-string (s-get-cross-reference-page s-label) in
+      let ib-num = inline-skip 3pt ++  read-inline ctx {#it-num;#it-title;} ++ inline-skip 3pt in
+      let ib-page = inline-skip 3pt ++ read-inline ctx {#it-page;} ++ inline-skip 3pt in
+      let ib-toc-line =
+        let w = l-text-width -' (get-natural-width ib-num) -'
+          (get-natural-width ib-page)
+        in
+          ib-make-dots-line ctx w
+      in
+        line-break true true ctx
+          (ib-link-to-location-frame s-label (ib-num ++ ib-toc-line ++ inline-fil ++ ib-page))
+
+
+  % 表目次用
+    let bb-make-toc-table ctx l-text-width s-label it-title =
+      let it-num = embed-string (s-get-cross-reference-num s-label) in
+      let it-page = embed-string (s-get-cross-reference-page s-label) in
+      let ib-num = inline-skip 3pt ++  read-inline ctx {#it-num;#it-title;} ++ inline-skip 3pt in
+      let ib-page = inline-skip 3pt ++ read-inline ctx {#it-page;} ++ inline-skip 3pt in
+      let ib-toc-line =
+        let w = l-text-width -' (get-natural-width ib-num) -'
+          (get-natural-width ib-page)
+        in
+          ib-make-dots-line ctx w
+      in
+        line-break true true ctx
+          (ib-link-to-location-frame s-label (ib-num ++ ib-toc-line ++ inline-fil ++ ib-page))
+
+
+% しおり作成用の関数
+  % しおり用のlist
+  % register-outline で読み込むために (int, string, string, bool)list
+  % それぞれ (階層, テキスト, ジャンプ先のキー名, デフォルトの折りたたみ状態)
+  let-mutable outline-ref <- []
+
+
+% タイトルを出力する
+
+  % タイトルのdeco
+  % 今回はシンプルに何も出力しないもので
+  % deco-set 型
+  let title-deco =
+    let deco (x, y) w h d =
+      []
+    in
+      (deco, deco, deco, deco)
+
+  % タイトルを出力するコマンド
+  let make-title ctx it-title it-author it-date =
+    let pads = (20pt, 20pt, 20pt, 20pt) in
+      block-frame-breakable ctx pads title-deco (fun ctx -> (
+        let ctx-title =
+          ctx |> set-font-size font-size-title
+              |> set-font Latin font-latin-roman
+        in
+        let ctx-author =
+          ctx |> set-font-size font-size-author
+              |> set-font Latin font-latin-roman
+        in
+        let ctx-date =
+          ctx |> set-font-size font-size-date
+              |> set-font Latin font-latin-roman
+        in
+
+        let ib-title = read-inline ctx-title it-title in
+        let ib-author = read-inline ctx-author it-author in
+        let ib-date = read-inline ctx-date it-date in
+
+        let bb-title =
+          let ctx-bb-title = set-paragraph-margin 12pt 0pt ctx in
+            line-break true true ctx-bb-title (inline-fil ++ ib-title ++ inline-fil)
+        in
+        let bb-author =
+          let ctx-bb-author = set-paragraph-margin 12pt 0pt ctx in
+            line-break true true ctx-bb-author (inline-fil ++ ib-author ++ inline-fil)
+        in
+        let bb-date =
+          let ctx-bb-date = set-paragraph-margin 12pt 0pt ctx in
+            line-break true true ctx-bb-date (inline-fil ++ ib-date ++ inline-fil)
+        in
+          bb-title +++ block-skip 5pt +++ bb-author +++ block-skip 5pt +++ bb-date
+      ))
+
+
+
+% document型を返すメインの関数定義
+
+let document record inner =
+
+  % ページの余白設定
+  let page-width = 210mm in
+  let page-height = 297mm in
+  let top-space = 20mm in
+  let bottom-space = 20mm in
+  let left-space = (page-width -' ((font-size-normal *' font-ratio-cjk) *' 40.0)) *' 0.5 in
+  let right-space = (page-width -' ((font-size-normal *' font-ratio-cjk) *' 40.0)) *' 0.5 in
+  let text-width = page-width -' left-space -' right-space in
+
+  % ctx設定
+  let ctx-doc = ctx-get-initial-context text-width in
+
+  % レコード取り出し
+  let it-title = record#title in
+  let it-author = record#author in
+  let it-date = record#date in
+
+  % title部分の定義
+  let bb-title = make-title ctx-doc it-title it-author it-date in
+
+  % 文章本体の定義
+  let bb-main = read-block ctx-doc inner in
+
+  % 目次部分の定義
+  let bb-toc =
+    let bb-toc-main =
+      let bb-toc-main-main = !toc-list |> List.reverse |> List.map (fun list -> (
+        match list with
+          | Section (label, title) -> bb-make-toc-section ctx-doc text-width label title
+          | SubSection (label, title) -> bb-make-toc-subsection ctx-doc text-width label title
+      )) |> List.fold-left (+++) block-nil
+      in
+      let bb-toc-main-title =
+        let ctx-toc-main-title = ctx-doc
+          |> set-font-size font-size-section
+          |> set-cjk-font font-cjk-gothic
+          |> set-latin-font font-latin-sans
+          |> set-paragraph-margin 20pt 12pt
+        in
+          line-break true false ctx-doc (read-inline ctx-toc-main-title {目次} ++ inline-fil)
+      in
+        bb-toc-main-title +++ bb-toc-main-main
+    in
+    let bb-toc-figure =
+      let bb-toc-figure-main =
+        !fig-toc-list |> List.reverse |> List.map (fun (list, title) ->
+          bb-make-toc-table ctx-doc text-width list title) |> List.fold-left (+++) block-nil
+      in
+      let bb-toc-figure-title =
+        let ctx-toc-figure-title = ctx-doc
+          |> set-font-size font-size-section
+          |> set-cjk-font font-cjk-gothic
+          |> set-latin-font font-latin-sans
+          |> set-paragraph-margin 20pt 12pt
+        in
+          line-break true false ctx-doc (read-inline ctx-toc-figure-title {図目次} ++ inline-fil)
+      in
+        bb-toc-figure-title +++ bb-toc-figure-main
+    in
+    let bb-toc-table =
+      let bb-toc-table-main =
+        !fig-toc-list |> List.reverse |> List.map (fun (list, title) ->
+          bb-make-toc-table ctx-doc text-width list title) |> List.fold-left (+++) block-nil
+      in
+      let bb-toc-table-title =
+        let ctx-toc-table-title = ctx-doc
+          |> set-font-size font-size-section
+          |> set-cjk-font font-cjk-gothic
+          |> set-latin-font font-latin-sans
+          |> set-paragraph-margin 20pt 12pt
+        in
+          line-break true false ctx-doc (read-inline ctx-toc-table-title {表目次} ++ inline-fil)
+      in
+        bb-toc-table-title +++ bb-toc-table-main
+    in
+      bb-toc-main +++ bb-toc-figure +++ bb-toc-table
+  in
+
+
+  % ページサイズ（今回はA4）
+  let page = UserDefinedPaper(page-width, page-height) in
+
+  % コンテンツを表示させる部分の指定
+  let pagecontf pbinfo =
+    (|
+      text-height = page-height -' (top-space +' bottom-space);
+      text-origin = (left-space, top-space);
+    |)
+  in
+
+  % ヘッダーとフッター
+  let pagepartsf pbinfo =
+    let page-num = embed-string (arabic pbinfo#page-number) in
+    let ctx = set-paragraph-margin 0pt 0pt ctx-doc in
+    let header = block-nil in
+    let header-origin = (left-space, 0pt) in
+    let footer =
+      let footer-main = line-break true true ctx (inline-fil ++ (read-inline ctx {#page-num;}) ++ inline-fil)
+      in
+        block-skip (bottom-space *' 0.2) +++ footer-main
+    in
+    let footer-origin = (left-space, page-height -' bottom-space) in
+    (|
+      header-content = header;
+      header-origin = header-origin;
+      footer-content = footer;
+      footer-origin = footer-origin;
+    |)
+  in
+
+  % メイン
+  let doc-main = page-break page pagecontf pagepartsf (bb-title +++ bb-toc +++ clear-page +++ bb-main) in
+  % ラベルを設置する関数の実行
+  let () = register-outline (List.reverse !outline-ref) in
+    doc-main
+
+
+
+% section設定
+
+let-mutable section-num <- 0
+let-mutable subsection-num <- 0
+
+let bb-make-section ctx label title inner =
+  % section番号などの処理
+  let () = section-num <- !section-num + 1 in
+  let () = subsection-num <- 0 in
+  let s-num = arabic !section-num ^ `. `# in
+
+  % タイトルのctx
+  let ctx-title = ctx
+        |> set-font-size font-size-section
+        |> set-cjk-font font-cjk-gothic
+        |> set-latin-font font-latin-bold
+  in
+
+  % タイトルとハイパーリンクの処理
+  let ib-title =
+    ib-register-location-frame label (read-inline ctx-title title)
+  in
+  let s-title = extract-string ib-title in
+  let ib-title-link = ib-register-cross-reference-page label s-title in
+  let () = u-register-cross-reference-num label s-num in
+  let outline-title = extract-string ib-title in
+
+  let () = outline-ref <- (1, s-num ^ `. `# ^ outline-title, label, true) :: !outline-ref in
+
+  let ib-num = read-inline ctx-title (embed-string s-num) in
+
+  % toc-listへの登録
+  let () = toc-list <- (Section (label, title)) :: !toc-list in
+
+  let bb-title =
+    line-break true false ctx (ib-num ++ ib-title ++ ib-title-link)
+  in
+  let bb-inner = read-block ctx inner in
+    bb-title +++ bb-inner
+
+
+let bb-make-subsection ctx label title inner =
+  % section番号などの処理
+  let () = subsection-num <- !subsection-num + 1 in
+  let s-num = arabic !section-num ^ `. `# ^ arabic !subsection-num ^ `. `# in
+
+  % タイトルのctx
+  let ctx-title = ctx
+        |> set-font-size font-size-subsection
+        |> set-cjk-font font-cjk-gothic
+        |> set-latin-font font-latin-bold
+  in
+
+  % タイトルとハイパーリンクの処理
+  let ib-title =
+    ib-register-location-frame label (read-inline ctx-title title)
+  in
+  let s-title = extract-string ib-title in
+  let ib-title-link = ib-register-cross-reference-page label s-title in
+  let () = u-register-cross-reference-num label s-num in
+  let outline-title = extract-string ib-title in
+
+  let () = outline-ref <- (2, s-num ^ `. `# ^ outline-title, label, true) :: !outline-ref in
+
+  let ib-num = read-inline ctx-title (embed-string s-num) in
+
+  % toc-listへの登録
+  let () = toc-list <- (SubSection(label, title)) :: !toc-list in
+
+  let bb-title =
+    line-break true false ctx (ib-num ++ ib-title ++ ib-title-link)
+  in
+  let bb-inner = read-block ctx inner in
+    bb-title +++ bb-inner
+
+
+% 実装
+
+let-mutable section-count <- 0
+
+let-block ctx +section ?:labelopt title inner =
+  let label =
+    match labelopt with
+    | None -> `section:` ^ (arabic !section-count)
+    | Some(s) -> s
+  in
+  let () = section-count <- !section-count + 1 in
+    bb-make-section ctx label title inner
+
+let-mutable subsection-count <- 0
+
+let-block ctx +subsection ?:labelopt title inner =
+  let label =
+    match labelopt with
+    | None -> `subsectgion:` ^ (arabic !subsection-count)
+    | Some(s) -> s
+  in
+  let () = subsection-count <- !subsection-count + 1 in
+    bb-make-subsection ctx label title inner
+
+
+
+% インデント
+
+let indent ctx = inline-skip ((get-font-size ctx) *' font-ratio-cjk)
+
+% 段落コマンド
+
+let-block ctx +p inner =
+  let ib-indent = indent ctx in
+  let ib-inner = read-inline ctx inner in
+    line-break true true ctx (ib-indent ++ ib-inner ++ inline-fil)
+
+let-block ctx +pn inner =
+  let ib-inner = read-inline ctx inner in
+    line-break true true ctx (ib-inner ++ inline-fil)
+
+
+
+% 画像出力と表出力
+
+
+let bb-make-figure ctx label caption inner =
+  let bb-caption = line-break true false ctx (inline-fil ++ read-inline ctx caption ++ inline-fil) in
+  let bb-inner = read-block ctx inner in
+    bb-inner +++ block-skip 5pt +++ bb-caption
+
+
+let bb-make-table ctx label caption inner =
+  let bb-caption = line-break true false ctx (inline-fil ++ read-inline ctx caption ++ inline-fil) in
+  let bb-inner = read-block ctx inner in
+    bb-caption +++ block-skip 5pt +++ bb-inner
+
+
+let-mutable figure-count <- 0
+
+let-block ctx +figure ?:labelopt caption inner =
+  let label =
+    match labelopt with
+    | None -> `figure:` ^ (arabic !figure-count)
+    | Some(s) -> s
+  in
+  let () = figure-count <- !figure-count + 1 in
+    bb-make-figure ctx label caption inner
+
+
+let-mutable table-count <- 0
+
+let-block ctx +table ?:labelopt caption inner =
+  let label =
+    match labelopt with
+    | None -> `table:` ^ (arabic !table-count)
+    | Some(s) -> s
+  in
+  let () = table-count <- !table-count + 1 in
+    bb-make-table ctx label caption inner
+
+end
+
+let document = NewCls.document
